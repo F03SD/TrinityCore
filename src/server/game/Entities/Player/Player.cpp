@@ -2331,6 +2331,7 @@ void Player::InitStatsForLevel(bool reapplyMods)
 
     // set default cast time multiplier
     SetModCastingSpeed(1.0f);
+    SetModCastingSpeedNeg(1.0f);
     SetModSpellHaste(1.0f);
     SetModHaste(1.0f);
     SetModRangedHaste(1.0f);
@@ -4307,10 +4308,15 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
     {
         SetHealth(GetMaxHealth() * restore_percent);
         SetPower(POWER_MANA, GetMaxPower(POWER_MANA) * restore_percent);
-        SetPower(POWER_RAGE, 0);
-        SetPower(POWER_ENERGY, GetMaxPower(POWER_ENERGY) * restore_percent);
-        SetPower(POWER_FOCUS, GetMaxPower(POWER_FOCUS) * restore_percent);
-        SetPower(POWER_LUNAR_POWER, 0);
+    }
+
+    for (Powers power : GetPowerTypes())
+    {
+        PowerTypeEntry const* powerType = sDB2Manager.GetPowerTypeEntry(power);
+        if (powerType->GetFlags().HasFlag(PowerTypeFlags::SetToMaxOnResurrect))
+            SetPower(power, GetMaxPower(power));
+        else if (!powerType->GetFlags().HasFlag(PowerTypeFlags::NotSetToDefaultOnResurrect))
+            SetPower(power, powerType->DefaultPower);
     }
 
     // trigger update zone for alive state zone updates
@@ -4410,7 +4416,7 @@ Corpse* Player::CreateCorpse()
 
     _corpseLocation.WorldRelocate(*this);
 
-    uint32 flags = 0;
+    CorpseFlags flags = CORPSE_FLAG_NONE;
     if (*m_unitData->PvpFlags & UNIT_BYTE2_FLAG_PVP)
         flags |= CORPSE_FLAG_PVP;
     if (InBattleground() && !InArena())
@@ -4421,10 +4427,16 @@ Corpse* Player::CreateCorpse()
     corpse->SetRace(GetRace());
     corpse->SetSex(GetNativeGender());
     corpse->SetClass(GetClass());
-    corpse->SetCustomizations(Trinity::Containers::MakeIteratorPair(m_playerData->Customizations.begin(), m_playerData->Customizations.end()));
-    corpse->ReplaceAllFlags(flags);
+    corpse->SetCustomizations({ m_playerData->Customizations.begin(), m_playerData->Customizations.end() });
+    corpse->ReplaceAllCorpseFlags(flags);
     corpse->SetDisplayId(GetNativeDisplayId());
     corpse->SetFactionTemplate(sChrRacesStore.AssertEntry(GetRace())->FactionID);
+
+    if (Group const* group = GetGroup())
+        corpse->SetPartyGUID(group->GetGUID());
+
+    if (Guild const* guild = GetGuild())
+        corpse->SetGuildGUID(guild->GetGUID());
 
     for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; i++)
         if (ItemModifiedAppearanceEntry const* itemModifiedAppearance = sItemModifiedAppearanceStore.LookupEntry(m_playerData->VisibleItems[i].ItemModifiedAppearanceID))
@@ -5301,6 +5313,7 @@ void Player::UpdateRating(CombatRating cr)
             float const multiplier = GetRatingMultiplier(cr);
             float const oldVal = ApplyRatingDiminishing(cr, oldRating * multiplier);
             float const newVal = ApplyRatingDiminishing(cr, amount * multiplier);
+            int32 highestOtherRating = 0;
             switch (cr)
             {
                 case CR_HASTE_MELEE:
@@ -5308,19 +5321,29 @@ void Player::UpdateRating(CombatRating cr)
                     ApplyAttackTimePercentMod(OFF_ATTACK, oldVal, false);
                     ApplyAttackTimePercentMod(BASE_ATTACK, newVal, true);
                     ApplyAttackTimePercentMod(OFF_ATTACK, newVal, true);
-                    if (GetClass() == CLASS_DEATH_KNIGHT)
-                        UpdatePowerRegen(POWER_RUNES);
+                    highestOtherRating = std::max({ m_activePlayerData->CombatRatings[CR_HASTE_RANGED], m_activePlayerData->CombatRatings[CR_HASTE_SPELL] });
                     break;
                 case CR_HASTE_RANGED:
                     ApplyAttackTimePercentMod(RANGED_ATTACK, oldVal, false);
                     ApplyAttackTimePercentMod(RANGED_ATTACK, newVal, true);
+                    highestOtherRating = std::max(m_activePlayerData->CombatRatings[CR_HASTE_MELEE], m_activePlayerData->CombatRatings[CR_HASTE_SPELL]);
                     break;
                 case CR_HASTE_SPELL:
                     ApplyCastTimePercentMod(oldVal, false);
+                    ApplySpellHastePercentMod(oldVal, false);
                     ApplyCastTimePercentMod(newVal, true);
+                    ApplySpellHastePercentMod(newVal, true);
+                    highestOtherRating = std::max(m_activePlayerData->CombatRatings[CR_HASTE_MELEE], m_activePlayerData->CombatRatings[CR_HASTE_RANGED]);
                     break;
                 default:
                     break;
+            }
+            float oldHasteRegenVal = ApplyRatingDiminishing(cr, std::max(oldRating, highestOtherRating) * multiplier);
+            float newHasteRegenVal = ApplyRatingDiminishing(cr, std::max(amount, highestOtherRating) * multiplier);
+            if (oldHasteRegenVal != newHasteRegenVal)
+            {
+                ApplyHasteRegenPercentMod(oldHasteRegenVal, false);
+                ApplyHasteRegenPercentMod(newHasteRegenVal, true);
             }
             break;
         }
@@ -27034,24 +27057,14 @@ uint8 Player::GetRunesState() const
 
 uint32 Player::GetRuneBaseCooldown() const
 {
-    double cooldown = RUNE_BASE_COOLDOWN;
+    PowerTypeEntry const* powerType = sDB2Manager.GetPowerTypeEntry(POWER_RUNES);
+    float regen = powerType->RegenPeace;
 
-    AuraEffectList const& regenAura = GetAuraEffectsByType(SPELL_AURA_MOD_POWER_REGEN_PERCENT);
-    for (AuraEffectList::const_iterator i = regenAura.begin();i != regenAura.end(); ++i)
-        if ((*i)->GetMiscValue() == POWER_RUNES)
-            cooldown *= 1.0 - (*i)->GetAmount() / 100.0;
+    uint32 powerIndex = GetPowerIndex(POWER_RUNES);
+    if (powerIndex <= MAX_POWERS_PER_CLASS)
+        regen += m_unitData->PowerRegenFlatModifier[powerIndex];
 
-    // Runes cooldown are now affected by player's haste from equipment ...
-    float hastePct = GetRatingBonusValue(CR_HASTE_MELEE);
-
-    // ... and some auras.
-    hastePct += GetTotalAuraModifier(SPELL_AURA_MOD_MELEE_HASTE);
-    hastePct += GetTotalAuraModifier(SPELL_AURA_MOD_MELEE_HASTE_2);
-    hastePct += GetTotalAuraModifier(SPELL_AURA_MOD_MELEE_HASTE_3);
-
-    cooldown *= 1.0f - (hastePct / 100.0f);
-
-    return static_cast<float>(cooldown);
+    return 1.0f / regen * uint32(IN_MILLISECONDS);
 }
 
 void Player::SetRuneCooldown(uint8 index, uint32 cooldown)
